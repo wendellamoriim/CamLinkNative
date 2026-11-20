@@ -1,0 +1,48 @@
+name: Build CamLinkNative IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios-app
+        run: xcodegen generate
+
+      - name: Build unsigned iOS app
+        working-directory: ios-app
+        run: |
+          xcodebuild \
+            -project CamLinkNative.xcodeproj \
+            -scheme CamLinkNative \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        working-directory: ios-app
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/CamLinkNative.app Payload/
+          zip -r -9 CamLinkNative.ipa Payload
+
+      - name: Upload CamLinkNative.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CamLinkNative-IPA
+          path: ios-app/CamLinkNative.ipa
+          retention-days: 30

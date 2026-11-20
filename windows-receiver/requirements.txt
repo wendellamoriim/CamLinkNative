@@ -1,0 +1,4 @@
+pyvirtualcam>=0.11.1
+numpy>=1.26.0
+sounddevice>=0.4.6
+zeroconf>=0.132.0
