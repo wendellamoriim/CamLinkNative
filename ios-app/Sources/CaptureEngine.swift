@@ -92,7 +92,7 @@ final class CaptureEngine: NSObject, ObservableObject {
             try audioSession.setCategory(
                 .playAndRecord,
                 mode: .measurement,
-                options: [.allowBluetooth, .defaultToSpeaker, .mixWithOthers]
+                options: [.allowBluetoothHFP, .defaultToSpeaker, .mixWithOthers]
             )
             try audioSession.setPreferredSampleRate(48000)
             try audioSession.setPreferredIOBufferDuration(0.01)
@@ -153,7 +153,7 @@ final class CaptureEngine: NSObject, ObservableObject {
 
         if !session.outputs.contains(videoOutput) {
             videoOutput.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelBufferPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
             ]
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
