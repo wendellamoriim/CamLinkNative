@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Combine
 
 enum CameraLens: String, CaseIterable, Identifiable {

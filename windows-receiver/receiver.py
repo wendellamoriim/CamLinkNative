@@ -30,11 +30,17 @@ def get_local_ip():
         s.close()
 
 def find_vb_cable_device():
+    apis = sd.query_hostapis()
     devices = sd.query_devices()
+    fallback = None
     for idx, d in enumerate(devices):
         if d["max_output_channels"] > 0 and "CABLE Input" in d["name"]:
-            return idx, d["name"]
-    return None, None
+            api_name = apis[d["hostapi"]]["name"]
+            if "WASAPI" in api_name:
+                return idx, f"{d['name']} [WASAPI]"
+            if fallback is None:
+                fallback = (idx, f"{d['name']} [{api_name}]")
+    return fallback if fallback else (None, None)
 
 def register_bonjour(ip, port):
     try:
