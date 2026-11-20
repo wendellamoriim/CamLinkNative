@@ -152,14 +152,20 @@ class VideoPipeline:
         if not ffmpeg_bin:
             raise RuntimeError("ffmpeg nao encontrado no PATH.")
 
-        self.cam = pyvirtualcam.Camera(
-            width=self.width,
-            height=self.height,
-            fps=self.fps,
-            fmt=pyvirtualcam.PixelFormat.NV12,
-            backend="obs",
-        )
-        print(f"[VIDEO] OBS Virtual Camera ativa: {self.cam.device} ({self.width}x{self.height} @ {self.fps} FPS NV12)")
+        # Tenta abrir a câmera virtual — continua mesmo se falhar
+        try:
+            self.cam = pyvirtualcam.Camera(
+                width=self.width,
+                height=self.height,
+                fps=self.fps,
+                fmt=pyvirtualcam.PixelFormat.NV12,
+                backend="obs",
+            )
+            print(f"[VIDEO] OBS Virtual Camera ativa: {self.cam.device} ({self.width}x{self.height} @ {self.fps} FPS NV12)")
+        except Exception as e:
+            self.cam = None
+            print(f"[VIDEO] AVISO: Camara virtual nao disponivel ({e})")
+            print("[VIDEO] Vídeo chegando mas nao será exibido. Abra o OBS e inicie a Camara Virtual, depois reconecte.")
 
         cmd = [
             ffmpeg_bin,

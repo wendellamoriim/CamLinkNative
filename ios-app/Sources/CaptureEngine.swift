@@ -57,6 +57,19 @@ final class CaptureEngine: NSObject, ObservableObject {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+        // Retoma a sessão automaticamente após interrupção (ligação, Siri, etc.)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionInterruption),
+            name: AVCaptureSession.wasInterruptedNotification,
+            object: session
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionInterruptionEnded),
+            name: AVCaptureSession.interruptionEndedNotification,
+            object: session
+        )
     }
 
     deinit {
@@ -137,6 +150,25 @@ final class CaptureEngine: NSObject, ObservableObject {
     @objc private func handleAudioRouteChange() {
         sessionQueue.async { [weak self] in
             self?.configureAudioSession()
+        }
+    }
+
+    @objc private func handleSessionInterruption(_ notification: Notification) {
+        // Sessão interrompida (ligação, Siri, FaceTime, etc.) — para o encoder
+        encoder.stop()
+    }
+
+    @objc private func handleSessionInterruptionEnded(_ notification: Notification) {
+        // Interrupção terminou — retoma sessão e encoder automaticamente
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+            self.encoder.configure(
+                width: 1080, height: 1920,
+                fps: self.fps, bitrateMbps: self.bitrateMbps
+            )
         }
     }
 
