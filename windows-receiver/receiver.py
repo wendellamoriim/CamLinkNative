@@ -47,7 +47,7 @@ def register_bonjour(ip, port):
         zc = Zeroconf()
         info = ServiceInfo(
             "_camlink._tcp.local.",
-            f"PC-Desktop._camlink._tcp.local.",
+            "PC-Desktop._camlink._tcp.local.",
             addresses=[socket.inet_aton(ip)],
             port=port,
             properties={"version": "1.0"},
@@ -58,6 +58,7 @@ def register_bonjour(ip, port):
         print(f"[AVISO] Bonjour indisponivel ({e}) - conecte pelo IP {ip}")
         return None, None
 
+
 class AudioRouter:
     def __init__(self):
         self.stream = None
@@ -67,7 +68,7 @@ class AudioRouter:
         if self.device_idx is not None:
             print(f"[AUDIO] Saida virtual encontrada: {self.device_name} (ID {self.device_idx})")
         else:
-            print("[AUDIO] AVISO: VB-Cable nao detectado ainda! Instale o VB-Cable para ativar o microfone virtual.")
+            print("[AUDIO] AVISO: VB-Cable nao detectado! Instale o VB-Cable.")
 
     def configure(self, sample_rate, channels):
         if self.device_idx is None:
@@ -113,6 +114,19 @@ class AudioRouter:
 
 
 class VideoPipeline:
+    """
+    Pipeline de 3 threads completamente desacopladas:
+
+      [socket]  -->  _h264_queue  -->  [_write_loop]  --> ffmpeg stdin
+                                                              |
+                                                        ffmpeg stdout
+                                                              |
+                                                       [_read_loop]  -->  _obs_queue  -->  [_obs_send_loop]  --> OBS VirtualCam
+
+    Cada fila tem tamanho máximo pequeno e descarta o frame mais antigo
+    quando cheia, garantindo latência sempre baixa sem travar nenhuma thread.
+    """
+
     def __init__(self, width=1080, height=1920, fps=30):
         self.width = width
         self.height = height
@@ -121,11 +135,16 @@ class VideoPipeline:
         self.ffmpeg = None
         self.cam = None
         self.running = False
-        self.reader_thread = None
-        self.writer_thread = None
         self.frames_count = 0
-        # Buffer queue: max 60 chunks para evitar acumulo na memoria
+
+        # Fila de entrada H264 → ffmpeg (max 60 chunks ~2s de buffer)
         self._h264_queue = queue.Queue(maxsize=60)
+        # Fila de frames decodificados → OBS (max 2 frames — descarta se OBS travar)
+        self._obs_queue = queue.Queue(maxsize=2)
+
+        self._write_thread = None
+        self._read_thread = None
+        self._obs_thread = None
 
     def start(self):
         self.stop()
@@ -167,16 +186,16 @@ class VideoPipeline:
         )
         self.running = True
 
-        # Thread separada para escrever no stdin do ffmpeg (nao bloqueia o socket)
-        self.writer_thread = threading.Thread(target=self._write_loop, daemon=True)
-        self.writer_thread.start()
+        self._write_thread = threading.Thread(target=self._write_loop, daemon=True, name="h264-writer")
+        self._read_thread  = threading.Thread(target=self._read_loop,  daemon=True, name="frame-reader")
+        self._obs_thread   = threading.Thread(target=self._obs_send_loop, daemon=True, name="obs-sender")
 
-        # Thread separada para ler frames decodificados e enviar para OBS
-        self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.reader_thread.start()
+        self._write_thread.start()
+        self._read_thread.start()
+        self._obs_thread.start()
 
+    # ── Thread 1: socket → ffmpeg stdin ──────────────────────────────────
     def _write_loop(self):
-        """Lê da fila e escreve no stdin do ffmpeg sem bloquear o socket."""
         while self.running:
             try:
                 chunk = self._h264_queue.get(timeout=0.5)
@@ -189,8 +208,8 @@ class VideoPipeline:
             except Exception:
                 break
 
+    # ── Thread 2: ffmpeg stdout → _obs_queue ─────────────────────────────
     def _read_loop(self):
-        """Lê frames NV12 decodificados do stdout do ffmpeg e envia para OBS Virtual Camera."""
         out = self.ffmpeg.stdout
         need = self.frame_bytes
         while self.running:
@@ -201,30 +220,53 @@ class VideoPipeline:
                     self.running = False
                     return
                 buf.extend(chunk)
-            if len(buf) == need and self.cam is not None:
-                frame = np.frombuffer(buf, dtype=np.uint8)
+            if len(buf) == need:
+                frame = np.frombuffer(buf, dtype=np.uint8).copy()
+                # Descarta frame mais antigo se OBS não está consumindo rápido
+                if self._obs_queue.full():
+                    try:
+                        self._obs_queue.get_nowait()
+                    except queue.Empty:
+                        pass
                 try:
-                    self.cam.send(frame)
-                except Exception:
+                    self._obs_queue.put_nowait(frame)
+                except queue.Full:
                     pass
-                self.frames_count += 1
 
+    # ── Thread 3: _obs_queue → OBS Virtual Camera ────────────────────────
+    def _obs_send_loop(self):
+        """
+        Única thread que chama cam.send() — pode bloquear sem afetar o pipeline.
+        Se OBS não está lendo (ninguém abriu a câmera virtual), o timeout de 0.1s
+        garante que não ficamos presos aqui para sempre.
+        """
+        while self.running:
+            try:
+                frame = self._obs_queue.get(timeout=0.1)
+                if self.cam is not None:
+                    try:
+                        self.cam.send(frame)
+                    except Exception:
+                        pass
+                    self.frames_count += 1
+            except queue.Empty:
+                continue
+
+    # ── API pública ───────────────────────────────────────────────────────
     def feed_h264(self, data: bytes):
-        """Enfileira dados H264 para processamento assíncrono."""
+        """Enfileira dados H264 vindos do socket."""
+        if self._h264_queue.full():
+            try:
+                self._h264_queue.get_nowait()
+            except queue.Empty:
+                pass
         try:
-            # Se a fila estiver cheia, descarta o pacote mais antigo para manter latência baixa
-            if self._h264_queue.full():
-                try:
-                    self._h264_queue.get_nowait()
-                except queue.Empty:
-                    pass
             self._h264_queue.put_nowait(data)
-        except Exception:
+        except queue.Full:
             pass
 
     def stop(self):
         self.running = False
-        # Sinaliza fim para o writer_thread
         try:
             self._h264_queue.put_nowait(None)
         except Exception:
@@ -243,12 +285,14 @@ class VideoPipeline:
             except Exception:
                 pass
             self.cam = None
-        # Limpa a fila
-        while not self._h264_queue.empty():
-            try:
-                self._h264_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Limpa filas
+        for q in (self._h264_queue, self._obs_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
 
 def recv_exact(sock, n):
     buf = bytearray()
@@ -258,6 +302,7 @@ def recv_exact(sock, n):
             return None
         buf.extend(chunk)
     return bytes(buf)
+
 
 def handle_client(conn, addr, video: VideoPipeline, audio: AudioRouter):
     print(f"\n[CONECTADO] iPhone conectado de {addr[0]}:{addr[1]}")
@@ -289,10 +334,11 @@ def handle_client(conn, addr, video: VideoPipeline, audio: AudioRouter):
 
             now = time.time()
             if now - last_stat >= 3.0:
-                mbps = (bytes_in * 8) / ((now - last_stat) * 1_000_000)
-                fps_real = video.frames_count / (now - last_stat)
-                q_size = video._h264_queue.qsize()
-                print(f"[STATUS] {fps_real:.1f} FPS | {mbps:.2f} Mbps | Queue: {q_size} | Audio: {audio.device_name or 'Sem VB-Cable'}")
+                mbps    = (bytes_in * 8) / ((now - last_stat) * 1_000_000)
+                fps_dec = video.frames_count / (now - last_stat)
+                q_in    = video._h264_queue.qsize()
+                q_obs   = video._obs_queue.qsize()
+                print(f"[STATUS] {fps_dec:.1f} FPS | {mbps:.2f} Mbps | In:{q_in} Obs:{q_obs} | Audio: {audio.device_name or 'Sem VB-Cable'}")
                 bytes_in = 0
                 video.frames_count = 0
                 last_stat = now
@@ -303,6 +349,7 @@ def handle_client(conn, addr, video: VideoPipeline, audio: AudioRouter):
         audio.close()
         conn.close()
         print("[AGUARDANDO] Pronto para nova conexao do iPhone...")
+
 
 def main():
     ip = get_local_ip()
@@ -318,7 +365,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
     srv.listen(1)
-    print(f"[AGUARDANDO] Abra o CamLinkNative no iPhone 15 e toque em TRANSMITIR...\n")
+    print(f"[AGUARDANDO] Abra o CamLinkNative no iPhone e toque em TRANSMITIR...\n")
 
     try:
         while True:
@@ -331,6 +378,7 @@ def main():
             zc.unregister_service(info)
             zc.close()
         srv.close()
+
 
 if __name__ == "__main__":
     main()
