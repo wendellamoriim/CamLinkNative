@@ -11,6 +11,7 @@ final class H264Encoder {
     private var height: Int32 = 1920
     private var fps: Int = 30
     private var bitrateBps: Int = 8_000_000
+    private var isEncodingFrame: Bool = false
 
     func configure(width: Int32, height: Int32, fps: Int, bitrateMbps: Int) {
         queue.async { [weak self] in
@@ -20,6 +21,20 @@ final class H264Encoder {
             self.fps = fps
             self.bitrateBps = bitrateMbps * 1_000_000
             self.rebuildSession()
+        }
+    }
+
+    /// Fast in-flight bitrate adjustment without tearing down the hardware compression session
+    func updateBitrate(mbps: Int) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.bitrateBps = mbps * 1_000_000
+            if let s = self.session {
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: self.bitrateBps as CFNumber)
+                let bytesPerSec = self.bitrateBps / 8
+                let limits = [bytesPerSec * 2, 1] as CFArray
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
+            }
         }
     }
 
@@ -45,12 +60,15 @@ final class H264Encoder {
 
         guard status == noErr, let s = newSession else { return }
 
+        // Ultra-low latency real-time settings
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 2) as CFNumber)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 2.0 as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateBps as CFNumber)
+
         let bytesPerSec = bitrateBps / 8
         let limits = [bytesPerSec * 2, 1] as CFArray
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
@@ -65,6 +83,13 @@ final class H264Encoder {
 
         queue.async { [weak self] in
             guard let self, let s = self.session else { return }
+
+            // Drop if previous frame is still encoding to prevent hardware queue blowout
+            if self.isEncodingFrame {
+                return
+            }
+            self.isEncodingFrame = true
+
             VTCompressionSessionEncodeFrame(
                 s,
                 imageBuffer: imageBuffer,
@@ -73,6 +98,7 @@ final class H264Encoder {
                 frameProperties: nil,
                 infoFlagsOut: nil
             ) { [weak self] status, _, encodedBuffer in
+                defer { self?.isEncodingFrame = false }
                 guard status == noErr, let encodedBuffer else { return }
                 self?.handleEncoded(sampleBuffer: encodedBuffer)
             }
@@ -143,6 +169,7 @@ final class H264Encoder {
                 VTCompressionSessionInvalidate(s)
                 self?.session = nil
             }
+            self?.isEncodingFrame = false
         }
     }
 }

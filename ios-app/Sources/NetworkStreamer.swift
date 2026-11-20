@@ -16,7 +16,7 @@ final class NetworkStreamer: ObservableObject {
     private var browser: NWBrowser?
     private let queue = DispatchQueue(label: "com.salvador.camlink.net", qos: .userInteractive)
     private var inflightVideoPackets = 0
-    private let maxInflightVideo = 4
+    private let maxInflightVideo = 3
     private var currentHost: String = ""
     private var currentPort: UInt16 = 55880
 
@@ -28,8 +28,13 @@ final class NetworkStreamer: ObservableObject {
             guard let self else { return }
             if let first = results.first {
                 DispatchQueue.main.async {
-                    if case .service(let name, _, _, _) = first.endpoint {
+                    switch first.endpoint {
+                    case .service(let name, _, _, _):
                         self.discoveredHost = name
+                    case .hostPort(let host, _):
+                        self.discoveredHost = "\(host)"
+                    default:
+                        break
                     }
                 }
             }
@@ -45,22 +50,29 @@ final class NetworkStreamer: ObservableObject {
 
     func connect(host: String, port: UInt16 = 55880) {
         disconnect()
-        currentHost = host
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else {
+            DispatchQueue.main.async { self.statusText = "IP inválido" }
+            return
+        }
+
+        currentHost = trimmedHost
         currentPort = port
 
         let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.noDelay = true
+        tcpOptions.noDelay = true // Disable Nagle's algorithm for instant frame delivery
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 5
+        tcpOptions.keepaliveIdle = 3
 
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.serviceClass = .interactiveVideo
+        params.allowLocalEndpointReuse = true
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
+        let conn = NWConnection(host: NWEndpoint.Host(trimmedHost), port: nwPort, using: params)
 
         DispatchQueue.main.async {
-            self.statusText = "Conectando a \(host)..."
+            self.statusText = "Conectando a \(trimmedHost)..."
         }
 
         conn.stateUpdateHandler = { [weak self] state in
@@ -69,7 +81,7 @@ final class NetworkStreamer: ObservableObject {
                 switch state {
                 case .ready:
                     self.isConnected = true
-                    self.statusText = "AO VIVO • \(host)"
+                    self.statusText = "AO VIVO • \(trimmedHost)"
                 case .waiting(let err):
                     self.isConnected = false
                     self.statusText = "Aguardando PC (\(err.localizedDescription))"
@@ -119,7 +131,7 @@ final class NetworkStreamer: ObservableObject {
 
             if type == .videoH264 {
                 if self.inflightVideoPackets >= self.maxInflightVideo {
-                    return // Drop frame to keep latency ultra-low
+                    return // Discard late frame immediately to maintain zero buffer lag
                 }
                 self.inflightVideoPackets += 1
             }
@@ -137,7 +149,9 @@ final class NetworkStreamer: ObservableObject {
 
             conn.send(content: packet, completion: .contentProcessed { [weak self] _ in
                 if type == .videoH264 {
-                    self?.inflightVideoPackets = max(0, (self?.inflightVideoPackets ?? 1) - 1)
+                    self?.queue.async {
+                        self?.inflightVideoPackets = max(0, (self?.inflightVideoPackets ?? 1) - 1)
+                    }
                 }
             })
         }

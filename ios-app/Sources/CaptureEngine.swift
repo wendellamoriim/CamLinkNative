@@ -16,7 +16,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     let streamer = NetworkStreamer()
     private let encoder = H264Encoder()
 
-    private let sessionQueue = DispatchQueue(label: "com.salvador.camlink.session")
+    private let sessionQueue = DispatchQueue(label: "com.salvador.camlink.session", qos: .userInitiated)
     private let videoQueue = DispatchQueue(label: "com.salvador.camlink.video", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "com.salvador.camlink.audio", qos: .userInteractive)
 
@@ -27,6 +27,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     private var currentVideoDevice: AVCaptureDevice?
     private var lastConfigSentRate: Int = 0
 
+    // UI-bound properties (updated on Main Thread only when values actually change)
     @Published var selectedLens: CameraLens = .front
     @Published var fps: Int = 30
     @Published var bitrateMbps: Int = 8
@@ -34,14 +35,22 @@ final class CaptureEngine: NSObject, ObservableObject {
     @Published var isExposureLocked: Bool = false
     @Published var activeMicName: String = "Detectando..."
     @Published var availableMics: [AVAudioSessionPortDescription] = []
-    @Published var audioLevel: Float = 0.0
     @Published var permissionError: String?
+
+    // Audio level is published through a dedicated throttled Subject to NEVER swamp the SwiftUI main runloop
+    let audioLevelSubject = PassthroughSubject<Float, Never>()
+    private var lastAudioLevelSendTime: Double = 0.0
 
     override init() {
         super.init()
+
+        // Critical: Tell AVCaptureSession NOT to tamper with custom AVAudioSession routing!
+        session.automaticallyConfiguresApplicationAudioSession = false
+
         encoder.onEncodedFrame = { [weak self] data, ts in
             self?.streamer.sendPacket(type: .videoH264, timestampUs: ts, payload: data)
         }
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAudioRouteChange),
@@ -50,17 +59,22 @@ final class CaptureEngine: NSObject, ObservableObject {
         )
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     func start() {
         requestPermissions { [weak self] granted in
             guard let self else { return }
             if !granted {
                 DispatchQueue.main.async {
-                    self.permissionError = "Permita acesso a Camera e Microfone nos Ajustes do iPhone."
+                    self.permissionError = "Permita acesso a Câmera e Microfone nos Ajustes do iPhone."
                 }
                 return
             }
-            self.configureAudioSession()
+
             self.sessionQueue.async {
+                self.configureAudioSession()
                 self.configureCaptureSession()
                 self.encoder.configure(width: 1080, height: 1920, fps: self.fps, bitrateMbps: self.bitrateMbps)
                 self.session.startRunning()
@@ -74,7 +88,10 @@ final class CaptureEngine: NSObject, ObservableObject {
         streamer.stopDiscovery()
         encoder.stop()
         sessionQueue.async { [weak self] in
-            self?.session.stopRunning()
+            guard let self else { return }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
         }
     }
 
@@ -96,7 +113,7 @@ final class CaptureEngine: NSObject, ObservableObject {
             )
             try audioSession.setPreferredSampleRate(48000)
             try audioSession.setPreferredIOBufferDuration(0.01)
-            try audioSession.setActive(true)
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
 
             let inputs = audioSession.availableInputs ?? []
             if let preferred = preferredInput {
@@ -112,13 +129,15 @@ final class CaptureEngine: NSObject, ObservableObject {
             }
         } catch {
             DispatchQueue.main.async {
-                self.activeMicName = "Erro Audio: \(error.localizedDescription)"
+                self.activeMicName = "Erro Áudio: \(error.localizedDescription)"
             }
         }
     }
 
     @objc private func handleAudioRouteChange() {
-        configureAudioSession()
+        sessionQueue.async { [weak self] in
+            self?.configureAudioSession()
+        }
     }
 
     private func device(for lens: CameraLens) -> AVCaptureDevice? {
@@ -137,7 +156,11 @@ final class CaptureEngine: NSObject, ObservableObject {
         session.beginConfiguration()
         session.sessionPreset = .hd1920x1080
 
-        if let oldV = videoInput { session.removeInput(oldV) }
+        // Video Input
+        if let oldV = videoInput {
+            session.removeInput(oldV)
+            videoInput = nil
+        }
         if let dev = device(for: selectedLens), let vIn = try? AVCaptureDeviceInput(device: dev), session.canAddInput(vIn) {
             session.addInput(vIn)
             videoInput = vIn
@@ -145,12 +168,14 @@ final class CaptureEngine: NSObject, ObservableObject {
             applyFrameRate(to: dev, fps: fps)
         }
 
+        // Audio Input
         if audioInput == nil, let aDev = AVCaptureDevice.default(for: .audio),
            let aIn = try? AVCaptureDeviceInput(device: aDev), session.canAddInput(aIn) {
             session.addInput(aIn)
             audioInput = aIn
         }
 
+        // Video Output
         if !session.outputs.contains(videoOutput) {
             videoOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
@@ -160,6 +185,7 @@ final class CaptureEngine: NSObject, ObservableObject {
             if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
         }
 
+        // Audio Output
         if !session.outputs.contains(audioOutput) {
             audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
             if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
@@ -197,6 +223,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     }
 
     func switchLens(_ lens: CameraLens) {
+        guard lens != selectedLens else { return }
         selectedLens = lens
         isExposureLocked = false
         sessionQueue.async { [weak self] in
@@ -205,6 +232,7 @@ final class CaptureEngine: NSObject, ObservableObject {
     }
 
     func updateFPS(_ newFPS: Int) {
+        guard newFPS != fps else { return }
         fps = newFPS
         sessionQueue.async { [weak self] in
             guard let self, let dev = self.currentVideoDevice else { return }
@@ -215,8 +243,10 @@ final class CaptureEngine: NSObject, ObservableObject {
     }
 
     func updateBitrate(_ mbps: Int) {
+        guard mbps != bitrateMbps else { return }
         bitrateMbps = mbps
-        encoder.configure(width: 1080, height: 1920, fps: fps, bitrateMbps: mbps)
+        // Fast dynamic bitrate change without tearing down the compression session!
+        encoder.updateBitrate(mbps: mbps)
     }
 
     func toggleMirror() {
@@ -245,10 +275,27 @@ final class CaptureEngine: NSObject, ObservableObject {
         }
     }
 
+    func setFocusAndExposure(at point: CGPoint) {
+        guard let dev = currentVideoDevice else { return }
+        sessionQueue.async {
+            do {
+                try dev.lockForConfiguration()
+                if dev.isFocusPointOfInterestSupported && dev.isFocusModeSupported(.autoFocus) {
+                    dev.focusPointOfInterest = point
+                    dev.focusMode = .autoFocus
+                }
+                if dev.isExposurePointOfInterestSupported && dev.isExposureModeSupported(.autoExpose) {
+                    dev.exposurePointOfInterest = point
+                    dev.exposureMode = .autoExpose
+                }
+                dev.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
     func connect(to host: String) {
         lastConfigSentRate = 0
         streamer.connect(host: host, port: 55880)
-        encoder.configure(width: 1080, height: 1920, fps: fps, bitrateMbps: bitrateMbps)
     }
 
     func disconnect() {
@@ -319,11 +366,16 @@ extension CaptureEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             count = frames
         }
 
+        // THROTTLED AUDIO LEVEL UPDATE (max ~15Hz to keep SwiftUI Main Runloop 100% free and responsive)
         if count > 0 {
-            let rms = sqrt(sumSq / Double(count))
-            let level = Float(min(1.0, max(0.0, rms * 5.0)))
-            DispatchQueue.main.async {
-                self.audioLevel = self.audioLevel * 0.6 + level * 0.4
+            let now = CACurrentMediaTime()
+            if now - lastAudioLevelSendTime >= 0.066 {
+                lastAudioLevelSendTime = now
+                let rms = sqrt(sumSq / Double(count))
+                let level = Float(min(1.0, max(0.0, rms * 5.0)))
+                DispatchQueue.main.async { [weak self] in
+                    self?.audioLevelSubject.send(level)
+                }
             }
         }
 
