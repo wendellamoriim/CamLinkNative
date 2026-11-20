@@ -111,6 +111,7 @@ class AudioRouter:
                 pass
             self.stream = None
 
+
 class VideoPipeline:
     def __init__(self, width=1080, height=1920, fps=30):
         self.width = width
@@ -121,7 +122,10 @@ class VideoPipeline:
         self.cam = None
         self.running = False
         self.reader_thread = None
+        self.writer_thread = None
         self.frames_count = 0
+        # Buffer queue: max 60 chunks para evitar acumulo na memoria
+        self._h264_queue = queue.Queue(maxsize=60)
 
     def start(self):
         self.stop()
@@ -141,15 +145,17 @@ class VideoPipeline:
         cmd = [
             ffmpeg_bin,
             "-hide_banner", "-loglevel", "error",
-            "-fflags", "nobuffer",
+            "-fflags", "nobuffer+discardcorrupt",
             "-flags", "low_delay",
             "-probesize", "32768",
             "-analyzeduration", "0",
+            "-thread_queue_size", "512",
             "-f", "h264",
             "-i", "pipe:0",
             "-f", "rawvideo",
             "-pix_fmt", "nv12",
             "-s", f"{self.width}x{self.height}",
+            "-vsync", "0",
             "pipe:1",
         ]
         self.ffmpeg = subprocess.Popen(
@@ -160,10 +166,31 @@ class VideoPipeline:
             bufsize=0,
         )
         self.running = True
+
+        # Thread separada para escrever no stdin do ffmpeg (nao bloqueia o socket)
+        self.writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self.writer_thread.start()
+
+        # Thread separada para ler frames decodificados e enviar para OBS
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.reader_thread.start()
 
+    def _write_loop(self):
+        """Lê da fila e escreve no stdin do ffmpeg sem bloquear o socket."""
+        while self.running:
+            try:
+                chunk = self._h264_queue.get(timeout=0.5)
+                if chunk is None:
+                    break
+                if self.ffmpeg and self.ffmpeg.stdin:
+                    self.ffmpeg.stdin.write(chunk)
+            except queue.Empty:
+                continue
+            except Exception:
+                break
+
     def _read_loop(self):
+        """Lê frames NV12 decodificados do stdout do ffmpeg e envia para OBS Virtual Camera."""
         out = self.ffmpeg.stdout
         need = self.frame_bytes
         while self.running:
@@ -176,18 +203,32 @@ class VideoPipeline:
                 buf.extend(chunk)
             if len(buf) == need and self.cam is not None:
                 frame = np.frombuffer(buf, dtype=np.uint8)
-                self.cam.send(frame)
+                try:
+                    self.cam.send(frame)
+                except Exception:
+                    pass
                 self.frames_count += 1
 
-    def feed_h264(self, data):
-        if self.ffmpeg and self.ffmpeg.stdin and self.running:
-            try:
-                self.ffmpeg.stdin.write(data)
-            except Exception:
-                pass
+    def feed_h264(self, data: bytes):
+        """Enfileira dados H264 para processamento assíncrono."""
+        try:
+            # Se a fila estiver cheia, descarta o pacote mais antigo para manter latência baixa
+            if self._h264_queue.full():
+                try:
+                    self._h264_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._h264_queue.put_nowait(data)
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
+        # Sinaliza fim para o writer_thread
+        try:
+            self._h264_queue.put_nowait(None)
+        except Exception:
+            pass
         if self.ffmpeg:
             try:
                 self.ffmpeg.stdin.close()
@@ -202,6 +243,12 @@ class VideoPipeline:
             except Exception:
                 pass
             self.cam = None
+        # Limpa a fila
+        while not self._h264_queue.empty():
+            try:
+                self._h264_queue.get_nowait()
+            except queue.Empty:
+                break
 
 def recv_exact(sock, n):
     buf = bytearray()
@@ -244,7 +291,8 @@ def handle_client(conn, addr, video: VideoPipeline, audio: AudioRouter):
             if now - last_stat >= 3.0:
                 mbps = (bytes_in * 8) / ((now - last_stat) * 1_000_000)
                 fps_real = video.frames_count / (now - last_stat)
-                print(f"[STATUS] {fps_real:.1f} FPS | {mbps:.2f} Mbps | Audio: {audio.device_name or 'Sem VB-Cable'}")
+                q_size = video._h264_queue.qsize()
+                print(f"[STATUS] {fps_real:.1f} FPS | {mbps:.2f} Mbps | Queue: {q_size} | Audio: {audio.device_name or 'Sem VB-Cable'}")
                 bytes_in = 0
                 video.frames_count = 0
                 last_stat = now
