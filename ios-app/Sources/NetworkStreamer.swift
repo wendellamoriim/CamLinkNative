@@ -15,8 +15,11 @@ final class NetworkStreamer: ObservableObject {
     private var connection: NWConnection?
     private var browser: NWBrowser?
     private let queue = DispatchQueue(label: "com.salvador.camlink.net", qos: .userInteractive)
+
+    // Contador de frames de vídeo em voo — zerado sempre que a conexão muda de estado
     private var inflightVideoPackets = 0
     private let maxInflightVideo = 3
+
     private var currentHost: String = ""
     private var currentPort: UInt16 = 55880
 
@@ -60,7 +63,7 @@ final class NetworkStreamer: ObservableObject {
         currentPort = port
 
         let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.noDelay = true // Disable Nagle's algorithm for instant frame delivery
+        tcpOptions.noDelay = true
         tcpOptions.enableKeepalive = true
         tcpOptions.keepaliveIdle = 3
 
@@ -77,23 +80,36 @@ final class NetworkStreamer: ObservableObject {
 
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            DispatchQueue.main.async {
-                switch state {
-                case .ready:
+
+            // CRÍTICO: zera o contador de inflight em qualquer mudança de estado não-ready
+            // Evita que o contador fique preso após falha/reconexão
+            switch state {
+            case .ready:
+                self.queue.async { self.inflightVideoPackets = 0 }
+                DispatchQueue.main.async {
                     self.isConnected = true
                     self.statusText = "AO VIVO • \(trimmedHost)"
-                case .waiting(let err):
+                }
+            case .waiting(let err):
+                self.queue.async { self.inflightVideoPackets = 0 }
+                DispatchQueue.main.async {
                     self.isConnected = false
                     self.statusText = "Aguardando PC (\(err.localizedDescription))"
-                case .failed(let err):
+                }
+            case .failed(let err):
+                self.queue.async { self.inflightVideoPackets = 0 }
+                DispatchQueue.main.async {
                     self.isConnected = false
                     self.statusText = "Falha: \(err.localizedDescription)"
-                case .cancelled:
+                }
+            case .cancelled:
+                self.queue.async { self.inflightVideoPackets = 0 }
+                DispatchQueue.main.async {
                     self.isConnected = false
                     self.statusText = "Desconectado"
-                default:
-                    break
                 }
+            default:
+                break
             }
         }
 
@@ -131,7 +147,7 @@ final class NetworkStreamer: ObservableObject {
 
             if type == .videoH264 {
                 if self.inflightVideoPackets >= self.maxInflightVideo {
-                    return // Discard late frame immediately to maintain zero buffer lag
+                    return // Descarta frame tardio para manter latência zero
                 }
                 self.inflightVideoPackets += 1
             }
@@ -147,12 +163,14 @@ final class NetworkStreamer: ObservableObject {
             packet.append(header)
             packet.append(payload)
 
-            conn.send(content: packet, completion: .contentProcessed { [weak self] _ in
+            conn.send(content: packet, completion: .contentProcessed { [weak self] error in
                 if type == .videoH264 {
                     self?.queue.async {
                         self?.inflightVideoPackets = max(0, (self?.inflightVideoPackets ?? 1) - 1)
                     }
                 }
+                // Se houve erro de envio, o stateUpdateHandler já vai cuidar da reconexão
+                _ = error
             })
         }
     }

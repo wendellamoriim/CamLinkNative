@@ -11,7 +11,10 @@ final class H264Encoder {
     private var height: Int32 = 1920
     private var fps: Int = 30
     private var bitrateBps: Int = 8_000_000
-    private var isEncodingFrame: Bool = false
+
+    // Contador de frames em voo (0 ou 1) — evita fila sem travar permanentemente
+    private var pendingFrames: Int = 0
+    private let maxPendingFrames = 2 // aceita até 2 frames simultâneos no VT
 
     func configure(width: Int32, height: Int32, fps: Int, bitrateMbps: Int) {
         queue.async { [weak self] in
@@ -20,11 +23,12 @@ final class H264Encoder {
             self.height = height
             self.fps = fps
             self.bitrateBps = bitrateMbps * 1_000_000
+            self.pendingFrames = 0
             self.rebuildSession()
         }
     }
 
-    /// Fast in-flight bitrate adjustment without tearing down the hardware compression session
+    /// Ajuste rápido de bitrate sem recriar a sessão
     func updateBitrate(mbps: Int) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -43,6 +47,7 @@ final class H264Encoder {
             VTCompressionSessionInvalidate(s)
             session = nil
         }
+        pendingFrames = 0
 
         var newSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
@@ -60,7 +65,6 @@ final class H264Encoder {
 
         guard status == noErr, let s = newSession else { return }
 
-        // Ultra-low latency real-time settings
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
@@ -84,13 +88,13 @@ final class H264Encoder {
         queue.async { [weak self] in
             guard let self, let s = self.session else { return }
 
-            // Drop if previous frame is still encoding to prevent hardware queue blowout
-            if self.isEncodingFrame {
+            // Descarta frame se já há muitos em voo — mas NUNCA trava o flag
+            if self.pendingFrames >= self.maxPendingFrames {
                 return
             }
-            self.isEncodingFrame = true
+            self.pendingFrames += 1
 
-            VTCompressionSessionEncodeFrame(
+            let encodeStatus = VTCompressionSessionEncodeFrame(
                 s,
                 imageBuffer: imageBuffer,
                 presentationTimeStamp: pts,
@@ -98,9 +102,17 @@ final class H264Encoder {
                 frameProperties: nil,
                 infoFlagsOut: nil
             ) { [weak self] status, _, encodedBuffer in
-                defer { self?.isEncodingFrame = false }
+                // Decrementa SEMPRE — independente de sucesso ou erro
+                self?.queue.async { self?.pendingFrames = max(0, (self?.pendingFrames ?? 1) - 1) }
                 guard status == noErr, let encodedBuffer else { return }
                 self?.handleEncoded(sampleBuffer: encodedBuffer)
+            }
+
+            // Se a chamada em si falhou (sessão inválida), decrementa imediatamente
+            if encodeStatus != noErr {
+                self.pendingFrames = max(0, self.pendingFrames - 1)
+                // Sessão corrompida — reconstrói
+                self.rebuildSession()
             }
         }
     }
@@ -169,7 +181,7 @@ final class H264Encoder {
                 VTCompressionSessionInvalidate(s)
                 self?.session = nil
             }
-            self?.isEncodingFrame = false
+            self?.pendingFrames = 0
         }
     }
 }
